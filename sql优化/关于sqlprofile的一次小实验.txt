@@ -1,0 +1,101 @@
+打开一个会话：
+
+SQL> @yx/mysp
+
+       SID SPID
+---------- ------------------------
+       626 101077
+
+SQL> select empno from emp where empno=7788;
+
+     EMPNO
+----------
+      7788
+
+执行个几次：
+SQL> select address,hash_value,sql_id,sql_text,cursor_type,child_address from v$open_cursor where sid=626 and sql_text like 'select empno from emp%';
+
+ADDRESS          HASH_VALUE SQL_ID        SQL_TEXT                       CURSOR_TYPE                    CHILD_ADDRESS
+---------------- ---------- ------------- ------------------------------ ------------------------------ ----------------
+0000000061C383E8 1810967439 0tq36zdpz2awg select empno from emp where em SESSION CURSOR CACHED          0000000099981A40
+                                          pno=7788
+								
+换个会话：
+SQL> @yx/coe_xfr_sql_profile
+
+Parameter 1:
+SQL_ID (required)
+
+Enter value for 1: 0tq36zdpz2awg
+
+
+PLAN_HASH_VALUE AVG_ET_SECS
+--------------- -----------
+       56244932        .002
+
+Parameter 2:
+PLAN_HASH_VALUE (required)
+
+Enter value for 2: 56244932
+
+
+生成profile后，直接将文件手动修改为全表扫
+
+再绑之前，我们先来再做一次检查：
+ADDRESS          HASH_VALUE SQL_ID        SQL_TEXT                       CURSOR_TYPE                    CHILD_ADDRESS
+---------------- ---------- ------------- ------------------------------ ------------------------------ ----------------
+0000000061C383E8 1810967439 0tq36zdpz2awg select empno from emp where em SESSION CURSOR CACHED          0000000099981A40
+
+SQL> select CHILD_NUMBER,SQL_PROFILE,OBJECT_STATUS,PARSING_USER_ID from v$sql where sql_id='0tq36zdpz2awg';
+
+CHILD_NUMBER SQL_PROFILE                                                      OBJECT_STATUS       PARSING_USER_ID
+------------ ---------------------------------------------------------------- ------------------- ---------------
+           0                                                                  VALID                           112
+
+注意这里子游标0的对象状态是valid
+
+然后再开个会话绑定profile：
+[oracle@host01 ~]$ sqlplus sys/oracle@pdbprod1 as sysdba
+
+SQL> @coe_xfr_sql_profile_0tq36zdpz2awg_56244932.sql
+
+然后我们再来做上述查询：
+ADDRESS          HASH_VALUE SQL_ID        SQL_TEXT                       CURSOR_TYPE                    CHILD_ADDRESS
+---------------- ---------- ------------- ------------------------------ ------------------------------ ----------------
+0000000061C383E8 1810967439 0tq36zdpz2awg select empno from emp where em SESSION CURSOR CACHED          0000000099981A40
+                                          pno=7788
+
+CHILD_NUMBER SQL_PROFILE                                                      OBJECT_STATUS       PARSING_USER_ID
+------------ ---------------------------------------------------------------- ------------------- ---------------
+           0                                                                  INVALID_UNAUTH                  112
+
+我们发现，这里PGA依然缓存着之前的session cursor，但是子游标0的对象状态已经为invalid_unauth。
+
+我们在最开始打开的626会话进行原查询：
+SQL> select empno from emp where empno=7788;
+
+     EMPNO
+----------
+      7788
+
+SQL> select address,hash_value,sql_id,sql_text,cursor_type,child_address from v$open_cursor where sid=626 and sql_text like 'select empno from emp%';
+
+no rows selected
+
+SQL> select CHILD_NUMBER,SQL_PROFILE,OBJECT_STATUS,PARSING_USER_ID from v$sql where sql_id='0tq36zdpz2awg';
+CHILD_NUMBER SQL_PROFILE                                                      OBJECT_STATUS       PARSING_USER_ID
+------------ ---------------------------------------------------------------- ------------------- ---------------
+           1 coe_0tq36zdpz2awg_56244932                                       VALID                           112
+
+子游标0没了，新的子cursor 1出现。原本cache在PGA中的之前的session cursor也顺理成章的消失了。
+
+
+
+总结下就是：
+1.绑定了执行计划只有在再一次新的执行才会生效（这是显然的）
+2.由1可知，这将是一次硬解析。
+3.由实验可知，软软解析并不会对整个过程有任何影响。
+4.实际工作中，往往正在执行的sql，即使做了执行计划的绑定，但原子游标仍不会失效，需要终止正在执行的sql，并再次执行sql。
+这里的具体原因目前并不清楚，现象上猜测，sql到了执行阶段也不是完全和解析阶段就没了关系。
+这种情况下，有可能导致，sqlprofile虽然绑定了，但是就是不生效，解决方案是直接将原有的cursor清除，让sql再次硬解析。
+
